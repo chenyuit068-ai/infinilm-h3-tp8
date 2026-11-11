@@ -1,4 +1,5 @@
 #include "qwen3_5_vision.hpp"
+#include "../minimax_h3/h3_nine_bridge.hpp"
 
 #include "../../utils.hpp"
 
@@ -163,9 +164,12 @@ infinicore::Tensor Qwen35VisionAttention::forward(
     apply_2d_rope(q);
     apply_2d_rope(k);
 
-    auto out = infinicore::op::mha(q->unsqueeze(0), k->unsqueeze(0), v,
-                                   std::nullopt, scale_, false)
-                   ->view({seq_len, hidden_size_});
+    auto query = q->unsqueeze(0);
+    auto key = k->unsqueeze(0);
+    infinicore::Tensor attended;
+    if (!infinilm::h3_nine::try_compute("attention", query, key, v, attended))
+        attended = infinicore::op::mha(query, key, v, std::nullopt, scale_, false);
+    auto out = attended->view({seq_len, hidden_size_});
     return proj_->forward(out);
 }
 

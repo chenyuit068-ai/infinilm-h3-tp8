@@ -1,4 +1,5 @@
 #include "base_linear.hpp"
+#include "h3_streaming_weights.hpp"
 #include "infinicore/ops.hpp"
 #include <spdlog/spdlog.h>
 
@@ -28,11 +29,17 @@ BaseLinear::BaseLinear(size_t in_features, size_t out_features,
             desc.shape, desc.dtype, device,
             desc.split_dim, desc.tp_rank, desc.tp_size,
             desc.tp_num_heads >= 0 ? desc.tp_num_heads : 0);
+        if (param->storage()->is_placeholder()) {
+            if (desc.tp_size!=1 || !std::dynamic_pointer_cast<infinilm::quantization::NoneQuantization>(quantization_))
+                throw std::runtime_error("Streaming supports single-device unquantized linear weights only");
+            param->storage()->enable_streaming();
+        }
         this->register_parameter(desc.name, param);
     }
 }
 
 infinicore::Tensor BaseLinear::compute_linear(infinicore::Tensor &input) const {
+    infinilm::h3_streaming::LinearLease lease(parameters_);
     // Build params map from direct parameters only (not state_dict which uses a
     // static local and is not thread-safe across RankWorker threads).
     infinilm::quantization::ParamsMap params;
@@ -40,18 +47,23 @@ infinicore::Tensor BaseLinear::compute_linear(infinicore::Tensor &input) const {
         params[name] = static_cast<const infinicore::Tensor &>(param);
     }
 
-    return quantization_->forward(params, input, has_bias_, alpha_);
+    auto result=quantization_->forward(params, input, has_bias_, alpha_);
+    lease.finish();
+    return result;
 }
 
 infinicore::Tensor BaseLinear::compute_linear_allreduce(
     infinicore::Tensor &input,
     infinicclComm_t communicator) const {
+    infinilm::h3_streaming::LinearLease lease(parameters_);
     infinilm::quantization::ParamsMap params;
     for (const auto &[name, param] : parameters_) {
         params[name] = static_cast<const infinicore::Tensor &>(param);
     }
-    return quantization_->forward_allreduce(
+    auto result=quantization_->forward_allreduce(
         params, input, has_bias_, communicator, alpha_);
+    lease.finish();
+    return result;
 }
 
 infinicore::Tensor BaseLinear::forward(infinicore::Tensor &input) const {
@@ -65,6 +77,9 @@ infinicore::Tensor BaseLinear::forward(infinicore::Tensor &input, infinicore::Te
 }
 
 void BaseLinear::process_weights_after_loading() {
+    for (const auto &[name,param] : parameters_) {
+        if (param->storage()->is_streaming()) return;
+    }
     infinilm::quantization::ParamsMap params;
     for (const auto &[name, param] : parameters_) {
         params[name] = static_cast<const infinicore::Tensor &>(param);

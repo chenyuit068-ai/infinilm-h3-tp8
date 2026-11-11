@@ -1,4 +1,5 @@
 #include "minimax_h3_transformer.hpp"
+#include "h3_nine_bridge.hpp"
 
 #include "../../global_state/global_state.hpp"
 #include "../models_registry.hpp"
@@ -54,8 +55,18 @@ infinicore::Tensor gather_rows(const infinicore::Tensor &table,
 infinicore::Tensor apply_adaln(const infinicore::Tensor &normalized,
                                const infinicore::Tensor &scale,
                                const infinicore::Tensor &shift) {
+    infinicore::Tensor fused;
+    if (infinilm::h3_nine::try_compute("adaln", normalized, scale, shift, fused)) return fused;
     auto scaled = infinicore::op::mul(normalized, scale);
     return infinicore::op::add(infinicore::op::add(normalized, scaled), shift);
+}
+
+infinicore::Tensor apply_gated_residual(const infinicore::Tensor &x,
+                                              const infinicore::Tensor &gate,
+                                              const infinicore::Tensor &branch) {
+    infinicore::Tensor fused;
+    if (infinilm::h3_nine::try_compute("residual", x, gate, branch, fused)) return fused;
+    return infinicore::op::add(x, infinicore::op::mul(gate, branch));
 }
 
 void require_tensor(const std::optional<infinicore::Tensor> &tensor,
@@ -174,7 +185,9 @@ infinicore::Tensor MiniMaxH3Attention::forward(
         query = query_squeezed->unsqueeze(0);
         key = key_squeezed->unsqueeze(0);
     }
-    auto output = infinicore::op::mha(query, key, value, std::nullopt, scale_, false);
+    infinicore::Tensor output;
+    if (!infinilm::h3_nine::try_compute("attention", query, key, value, output))
+        output = infinicore::op::mha(query, key, value, std::nullopt, scale_, false);
     output = output->view({batch_size, sequence_length, inner_dim_});
     return linear_forward(out_proj_, output);
 }
@@ -337,13 +350,12 @@ infinicore::Tensor MiniMaxH3TransformerBlock::forward(
     auto normalized = norm1_->forward(hidden_states);
     normalized = apply_adaln(normalized, scale_msa, shift_msa);
     auto attention_output = attn_->forward(normalized, rope, position_ids, rotary_cos_sin_cache);
-    auto output = infinicore::op::add(
-        hidden_states, infinicore::op::mul(gate_msa, attention_output));
+    auto output = apply_gated_residual(hidden_states, gate_msa, attention_output);
 
     normalized = norm2_->forward(output);
     normalized = apply_adaln(normalized, scale_mlp, shift_mlp);
     auto mlp_output = ff_->forward(normalized);
-    output = infinicore::op::add(output, infinicore::op::mul(gate_mlp, mlp_output));
+    output = apply_gated_residual(output, gate_mlp, mlp_output);
     return output;
 }
 
